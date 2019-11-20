@@ -172,7 +172,7 @@ Reducer::Reducer(
       options = options.device(replicas_[i][0].device());
       options = options.dtype(at::kInt);
       local_used_maps_[i] =
-          at::empty({static_cast<long>(variable_count)}, options);
+          at::zeros({static_cast<long>(variable_count)}, options);
     }
   }
 }
@@ -254,6 +254,16 @@ void Reducer::mark_variable_ready_sparse(VariableIndex index) {
 // This function is only to be called from the autograd thread.
 void Reducer::autograd_hook(VariableIndex index) {
   std::lock_guard<std::mutex> lock(this->mutex_);
+
+  // We would like to call mark_unused_params for every iteration
+  // However it cannot be done here, because we cannot get what forward
+  // returned and cannot reset called_flag.
+  // That's why I want to expose mark_unused_params to front-end.
+  if (have not called mark_unused_params yet) {
+    mark_unused_params(??);
+    // Where to reset this flag to false? post-backward hook?
+    called_flag = true;
+  }
 
   // Ignore if we don't expect to be called.
   // This may be the case if the user wants to accumulate gradients
@@ -499,17 +509,67 @@ void Reducer::initialize_buckets(
   }
 }
 
+void Reducer::mark_unused_params(
+    const std::vector<torch::autograd::Variable>& outputs) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::unordered_set<torch::autograd::Node*> seen;
+  std::vector<torch::autograd::Node*> queue;
+
+  // Reset per iteration unused parameter accounting.
+  has_marked_unused_parameters_ = false;
+  unused_parameters_.clear();
+
+  if (outputs.empty()) {
+    return;
+  }
+
+  // Seed queue with the grad functions of all outputs.
+  for (const auto& output : outputs) {
+    const auto& grad_fn = output.grad_fn();
+    if (grad_fn) {
+      queue.push_back(grad_fn.get());
+    }
+  }
+
+  // Traverse the autograd graph starting at the specified output.
+  while (!queue.empty()) {
+    auto fn = queue.back();
+    queue.pop_back();
+    for (const auto& edge : fn->next_edges()) {
+      if (auto next_ptr = edge.function.get()) {
+        const bool was_inserted = seen.insert(next_ptr).second;
+        if (was_inserted) {
+          queue.push_back(next_ptr);
+        }
+      }
+    }
+  }
+
+  // Find accumulator functions that don't show up in this graph.
+  for (const auto& it : func_) {
+    const auto& var_idx = it.second;
+    // If the accumulator function is present in the graph, we know
+    // a gradient will be computed for the corresponding parameter.
+    if (seen.count(it.first) > 0) {
+      // Mark locally used parameters. During no_sync session, the same var can
+      // be set multiple times, which is OK as does to affect correctness. As
+      // long as it is used one during no_sync session, it is marked as used.
+      local_used_maps_[var_idx.replica_index][var_idx.variable_index] = 1;
+      continue;
+    }
+
+    unused_parameters_.push_back(var_idx);
+  }
+}
+
 // Traverse the autograd graph starting at the specified output.
 // All parameters for which we have a pointer to their gradient accumulation
 // functions, but don't show up in the autograd graph will be marked ready for
 // for reduction as soon as the first autograd hook is called. This is not
 // done immediately because the model output may be ignored, and we only
 // want to start performing reductions on `torch.autograd.backward()`.
-void Reducer::prepare_for_backward(
-    const std::vector<torch::autograd::Variable>& outputs) {
+void Reducer::prepare_for_backward() {
   std::lock_guard<std::mutex> lock(mutex_);
-  std::unordered_set<torch::autograd::Node*> seen;
-  std::vector<torch::autograd::Node*> queue;
 
   // Check that any prior reduction has finished.
   // The variable `require_finalize_` is true until all gradients
@@ -544,57 +604,6 @@ void Reducer::prepare_for_backward(
       replica.pending = replica.variables.size();
     }
     bucket.pending = bucket.replicas.size();
-  }
-
-  for (auto& local_used : local_used_maps_) {
-    local_used.fill_(1);
-  }
-
-  // Reset unused parameter accounting.
-  has_marked_unused_parameters_ = false;
-  unused_parameters_.clear();
-
-  // If no outputs are specified, we assume that autograd hooks for ALL
-  // variables will be called, and we don't have to search the autograd graph
-  // for presence of these hooks.
-  if (outputs.empty()) {
-    return;
-  }
-
-  // Seed queue with the grad functions of all outputs.
-  for (const auto& output : outputs) {
-    const auto& grad_fn = output.grad_fn();
-    if (grad_fn) {
-      queue.push_back(grad_fn.get());
-    }
-  }
-
-  // Traverse the autograd graph starting at the specified output.
-  while (!queue.empty()) {
-    auto fn = queue.back();
-    queue.pop_back();
-    for (const auto& edge : fn->next_edges()) {
-      if (auto next_ptr = edge.function.get()) {
-        const bool was_inserted = seen.insert(next_ptr).second;
-        if (was_inserted) {
-          queue.push_back(next_ptr);
-        }
-      }
-    }
-  }
-
-  // Find accumulator functions that don't show up in this graph.
-  for (const auto& it : func_) {
-    // If the accumulator function is present in the graph, we know
-    // a gradient will be computed for the corresponding parameter.
-    if (seen.count(it.first) > 0) {
-      continue;
-    }
-
-    // Mark locally unused parameters for this iteration
-    const auto& var_idx = it.second;
-    unused_parameters_.push_back(var_idx);
-    local_used_maps_[var_idx.replica_index][var_idx.variable_index] = 0;
   }
 }
 
@@ -663,6 +672,13 @@ void Reducer::finalize_backward() {
     } else {
       finalize_bucket_dense(bucket);
     }
+  }
+
+  // Reset per no_sync session/per iteration unused parameter accounting.
+  // Other per iter unused parameter accounting gets reset in the end of
+  // forward in mark_unused_params
+  for (auto& local_used : local_used_maps_) {
+    local_used.fill_(0);
   }
 }
 

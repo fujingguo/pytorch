@@ -451,17 +451,19 @@ class DistributedDataParallel(Module):
         else:
             output = self.module(*inputs, **kwargs)
 
+        # We'll return the output object verbatim since it is a freeform
+        # object. We need to find any tensors in this object, though,
+        # because we need to figure out which parameters were used during
+        # this forward pass, to ensure we short circuit reduction for any
+        # unused parameters. Only if `find_unused_parameters` is set.
+        if self.find_unused_parameters:
+            self.reducer.mark_unused_params([])
+        else:
+            self.reducer.mark_unused_params(list(_find_tensors(output)))
+
         if torch.is_grad_enabled() and self.require_backward_grad_sync:
             self.require_forward_param_sync = True
-            # We'll return the output object verbatim since it is a freeform
-            # object. We need to find any tensors in this object, though,
-            # because we need to figure out which parameters were used during
-            # this forward pass, to ensure we short circuit reduction for any
-            # unused parameters. Only if `find_unused_parameters` is set.
-            if self.find_unused_parameters:
-                self.reducer.prepare_for_backward(list(_find_tensors(output)))
-            else:
-                self.reducer.prepare_for_backward([])
+            self.reducer.prepare_for_backward()
         else:
             self.require_forward_param_sync = False
 
