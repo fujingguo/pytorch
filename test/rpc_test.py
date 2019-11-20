@@ -320,7 +320,7 @@ class RpcTest(object):
                 self_rank=self.rank,
                 worker_name_to_id=self.worker_name_to_id,
             )
-        rpc.join_rpc()
+        rpc.wait_all_workers()
 
     @dist_init(setup_rpc=False)
     def test_reinit(self):
@@ -353,7 +353,7 @@ class RpcTest(object):
                 self_rank=self.rank,
                 worker_name_to_id=self.worker_name_to_id,
             )
-        rpc.join_rpc()
+        rpc.wait_all_workers()
 
     @dist_init(setup_rpc=False)
     def test_invalid_names(self):
@@ -421,8 +421,8 @@ class RpcTest(object):
 
         from torch.distributed.rpc.api import _agent
         self.assertEqual(_agent, None)
-        # join_rpc() should not do anything as _agent is None
-        rpc.join_rpc()
+        # wait_all_workers() should not do anything as _agent is None
+        rpc.wait_all_workers()
         # We need this barrier here because although init_process_group is
         # blocking, it does not guarantee that all ranks are done with
         # initialization after the call. We did run into issues with it where
@@ -499,7 +499,7 @@ class RpcTest(object):
             self.assertEqual(ret, torch.ones(n, n) * 2)
 
     @dist_init(setup_rpc=False)
-    def test_join_rpc(self):
+    def test_wait_all_workers(self):
         # Initialize RPC.
         rpc.init_rpc(
             self_name="worker%d" % self.rank,
@@ -517,7 +517,7 @@ class RpcTest(object):
             args=(torch.ones(n, n), torch.ones(n, n)),
         )
         self.assertEqual(ret, torch.ones(n, n) * 2)
-        rpc.join_rpc()
+        rpc.wait_all_workers()
 
         with self.assertRaisesRegex(RuntimeError, "^RPC has not been initialized"):
             rpc.rpc_sync(
@@ -526,8 +526,8 @@ class RpcTest(object):
                 args=(torch.ones(n, n), torch.ones(n, n)),
             )
 
-        # it's safe to call join_rpc() multiple times
-        rpc.join_rpc()
+        # it's safe to call wait_all_workers() multiple times
+        rpc.wait_all_workers()
 
     @dist_init
     def test_expected_src(self):
@@ -1092,7 +1092,7 @@ class RpcTest(object):
         )
         set_timeout = rpc.get_rpc_timeout()
         self.assertEqual(timeout, set_timeout)
-        rpc.join_rpc()
+        rpc.wait_all_workers()
 
     @dist_init
     @requires_process_group_agent("PROCESS_GROUP rpc backend specific test, skip")
